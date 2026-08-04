@@ -1,17 +1,16 @@
 /*
  * ============================================================
- *  TESTE DE VALIDACAO DO CIRCUITO
+ *  TESTE DE VALIDACAO DO CIRCUITO + FILTRO RMS
  *  Projeto IC - Monitoramento Energetico
  * ============================================================
  *
- *  Este codigo NAO calcula corrente. Ele testa se o circuito
- *  de condicionamento (divisor + capacitor) esta funcionando
- *  corretamente ANTES de comecarmos a medir de verdade.
+ *  Este codigo testa o circuito de condicionamento (divisor + capacitor)
+ *  e agora utiliza o calculo RMS para extrair o sinal AC limpo.
  *
  *  Vai executar 3 testes em sequencia:
  *    1. Offset DC (verifica se esta em ~1,65V)
  *    2. Ruido (verifica estabilidade)
- *    3. Detecao de sinal (verifica se responde ao sensor)
+ *    3. Detecao de sinal (verifica se responde ao sensor com RMS)
  */
 
 #include <Arduino.h>
@@ -31,14 +30,27 @@ const int   OFFSET_TOLERANCIA     = 250;   // +/- desse valor
 const int   RUIDO_MAXIMO_OK       = 50;    // Variacao aceitavel
 
 // ============================================================
+//  ESTRUTURAS
+// ============================================================
+// Agrupa o resultado da amostragem, incluindo agora o valor RMS
+struct AmostragemStats {
+  int   minimo;
+  int   maximo;
+  int   variacao;   // maximo - minimo
+  float media;
+  float rmsTensao;  // Valor RMS convertido para Volts
+};
+
+// ============================================================
 //  PROTOTIPOS
 // ============================================================
 void teste1_offset();
 void teste2_ruido();
 void teste3_deteccaoSinal();
-float lerADCMedia(int amostras);
-int lerADCMinimo(int amostras);
-int lerADCMaximo(int amostras);
+
+AmostragemStats amostrarADC(int pino, int numAmostras, int atrasoMicros = 200);
+float adcParaTensao(float valorADC);
+void  separador(char c);
 
 // ============================================================
 //  SETUP
@@ -52,9 +64,9 @@ void setup() {
   analogSetAttenuation(ADC_11db);
 
   Serial.println();
-  Serial.println("==================================================");
+  separador('=');
   Serial.println(" TESTE DE VALIDACAO - Circuito de Offset SCT-013");
-  Serial.println("==================================================");
+  separador('=');
   Serial.println();
   Serial.println("Aguardando 3 segundos para estabilizacao...");
   Serial.println("(o capacitor precisa carregar completamente)");
@@ -66,9 +78,9 @@ void setup() {
   teste3_deteccaoSinal();
 
   Serial.println();
-  Serial.println("==================================================");
+  separador('=');
   Serial.println(" TESTES CONCLUIDOS");
-  Serial.println("==================================================");
+  separador('=');
   Serial.println("Se todos passaram: circuito OK, pode medir corrente.");
   Serial.println("Se algum falhou: veja a mensagem de diagnostico.");
   Serial.println();
@@ -76,67 +88,94 @@ void setup() {
 }
 
 // ============================================================
-//  LOOP - so imprime status periodicamente
+//  LOOP - Monitoramento limpo com RMS
 // ============================================================
 void loop() {
-  // Depois dos testes, so imprime leitura atual a cada 2s
-  // pra voce poder monitorar o circuito ao vivo
-  int leitura = analogRead(PINO_ADC);
-  float tensao = (leitura / (float)ADC_MAX) * VREF;
+  // Coleta um pacote de amostras e calcula o RMS para estabilizar a leitura ao vivo
+  AmostragemStats monitor = amostrarADC(PINO_ADC, NUM_AMOSTRAS_TESTE);
 
-  Serial.print("Monitor ao vivo -> ADC: ");
-  Serial.print(leitura);
-  Serial.print(" | Tensao: ");
-  Serial.print(tensao, 3);
-  Serial.println("V");
+  Serial.printf("Monitor ao vivo RMS -> Offset DC: %.3fV | Sinal AC (RMS): %.4fV\n", 
+                adcParaTensao(monitor.media), 
+                monitor.rmsTensao);
 
   delay(2000);
 }
 
 // ============================================================
+//  FUNCOES AUXILIARES
+// ============================================================
+
+// Le N amostras do pino aplicando o calculo RMS para isolar o sinal AC
+AmostragemStats amostrarADC(int pino, int numAmostras, int atrasoMicros) {
+  int   minimo = ADC_MAX;
+  int   maximo = 0;
+  double soma = 0;
+  double somaQuadrados = 0;
+
+  for (int i = 0; i < numAmostras; i++) {
+    int leitura = analogRead(pino);
+    if (leitura < minimo) minimo = leitura;
+    if (leitura > maximo) maximo = leitura;
+    
+    soma += leitura;
+    somaQuadrados += ((double)leitura * leitura); // Necessario para o calculo RMS
+    
+    delayMicroseconds(atrasoMicros);
+  }
+
+  double media = soma / numAmostras;
+  double mediaQuadrados = somaQuadrados / numAmostras;
+
+  // Formula da variancia: remove o Offset DC matematicamente
+  double variancia = mediaQuadrados - (media * media);
+  if (variancia < 0) variancia = 0;
+
+  double rmsADC = sqrt(variancia);
+
+  AmostragemStats stats;
+  stats.minimo    = minimo;
+  stats.maximo    = maximo;
+  stats.variacao  = maximo - minimo;
+  stats.media     = media;
+  stats.rmsTensao = adcParaTensao(rmsADC); // Converte o RMS do ADC para Volts
+
+  return stats;
+}
+
+// Converte uma leitura ADC (0-4095) para tensao em Volts
+float adcParaTensao(float valorADC) {
+  return (valorADC / (float)ADC_MAX) * VREF;
+}
+
+// Imprime uma linha separadora de 50 caracteres
+void separador(char c) {
+  for (int i = 0; i < 50; i++) Serial.print(c);
+  Serial.println();
+}
+
+// ============================================================
 //  TESTE 1 - OFFSET DC
 // ============================================================
-//  Pergunta: o ponto medio do divisor esta em ~1,65V?
-//  Como: mede a MEDIA de 500 leituras (sem sensor plugado
-//  ou com sensor sem corrente, a media = offset DC)
-//
-//  Aprovacao: offset entre 1798 e 2298 (equivale a
-//  1,45V - 1,85V), com o alvo sendo 2048 (1,65V exato)
-// ============================================================
 void teste1_offset() {
-  Serial.println("--------------------------------------------------");
+  separador('-');
   Serial.println(" TESTE 1: OFFSET DC");
-  Serial.println("--------------------------------------------------");
+  separador('-');
   Serial.println("Medindo o ponto medio do divisor de tensao...");
   Serial.println();
 
-  float media = lerADCMedia(NUM_AMOSTRAS_TESTE);
-  float tensaoMedia = (media / ADC_MAX) * VREF;
+  AmostragemStats stats = amostrarADC(PINO_ADC, NUM_AMOSTRAS_TESTE);
+  float diferenca = stats.media - OFFSET_ESPERADO;
 
-  Serial.print("Offset medido: ");
-  Serial.print(media, 1);
-  Serial.print(" (");
-  Serial.print(tensaoMedia, 3);
-  Serial.println("V)");
-
-  Serial.print("Offset esperado: ");
-  Serial.print(OFFSET_ESPERADO);
-  Serial.print(" (");
-  Serial.print((OFFSET_ESPERADO / (float)ADC_MAX) * VREF, 3);
-  Serial.println("V)");
-
-  Serial.print("Diferenca: ");
-  float diferenca = media - OFFSET_ESPERADO;
-  Serial.print(diferenca, 1);
-  Serial.println(" unidades ADC");
-
+  Serial.printf("Offset medido: %.1f (%.3fV)\n", stats.media, adcParaTensao(stats.media));
+  Serial.printf("Offset esperado: %d (%.3fV)\n", OFFSET_ESPERADO, adcParaTensao(OFFSET_ESPERADO));
+  Serial.printf("Diferenca: %.1f unidades ADC\n", diferenca);
   Serial.println();
 
   // Diagnostico
   if (abs(diferenca) <= OFFSET_TOLERANCIA) {
     Serial.println(">>> RESULTADO: PASSOU");
     Serial.println("    O divisor esta gerando ~1,65V como esperado.");
-  } else if (media > OFFSET_ESPERADO + OFFSET_TOLERANCIA) {
+  } else if (stats.media > OFFSET_ESPERADO + OFFSET_TOLERANCIA) {
     Serial.println(">>> RESULTADO: FALHOU - Offset ALTO demais");
     Serial.println("    POSSIVEIS CAUSAS:");
     Serial.println("    1. Voce alimentou o divisor com 5V em vez de 3,3V");
@@ -161,53 +200,27 @@ void teste1_offset() {
 // ============================================================
 //  TESTE 2 - RUIDO
 // ============================================================
-//  Pergunta: o sinal esta estavel (capacitor filtrando)?
-//  Como: mede a VARIACAO (max - min) das leituras
-//
-//  Aprovacao: variacao <= 50 unidades ADC (~40mV)
-//  Se muito ruidoso: capacitor com problema ou EMI forte
-// ============================================================
 void teste2_ruido() {
-  Serial.println("--------------------------------------------------");
+  separador('-');
   Serial.println(" TESTE 2: NIVEL DE RUIDO");
-  Serial.println("--------------------------------------------------");
+  separador('-');
   Serial.println("Medindo variacao das leituras...");
   Serial.println();
 
-  int minimo = 4095;
-  int maximo = 0;
-  long soma = 0;
+  AmostragemStats stats = amostrarADC(PINO_ADC, NUM_AMOSTRAS_TESTE);
+  float variacaoTensaoMV = adcParaTensao(stats.variacao) * 1000;
 
-  for (int i = 0; i < NUM_AMOSTRAS_TESTE; i++) {
-    int leitura = analogRead(PINO_ADC);
-    if (leitura < minimo) minimo = leitura;
-    if (leitura > maximo) maximo = leitura;
-    soma += leitura;
-    delayMicroseconds(200);
-  }
-
-  int variacao = maximo - minimo;
-  float mediaLocal = (float)soma / NUM_AMOSTRAS_TESTE;
-  float variacaoTensao = (variacao / (float)ADC_MAX) * VREF * 1000;  // em mV
-
-  Serial.print("Minimo lido: ");
-  Serial.println(minimo);
-  Serial.print("Maximo lido: ");
-  Serial.println(maximo);
-  Serial.print("Variacao (pico-a-pico): ");
-  Serial.print(variacao);
-  Serial.print(" unidades (");
-  Serial.print(variacaoTensao, 1);
-  Serial.println(" mV)");
-
+  Serial.printf("Minimo lido: %d\n", stats.minimo);
+  Serial.printf("Maximo lido: %d\n", stats.maximo);
+  Serial.printf("Variacao (pico-a-pico): %d unidades (%.1f mV)\n", stats.variacao, variacaoTensaoMV);
   Serial.println();
 
   // Diagnostico
-  if (variacao <= RUIDO_MAXIMO_OK) {
+  if (stats.variacao <= RUIDO_MAXIMO_OK) {
     Serial.println(">>> RESULTADO: PASSOU");
     Serial.println("    Ruido esta em nivel aceitavel.");
     Serial.println("    O capacitor esta filtrando bem.");
-  } else if (variacao <= 200) {
+  } else if (stats.variacao <= 200) {
     Serial.println(">>> RESULTADO: ALERTA - Ruido moderado");
     Serial.println("    O circuito funciona mas nao esta ideal.");
     Serial.println("    POSSIVEIS CAUSAS:");
@@ -233,82 +246,34 @@ void teste2_ruido() {
 // ============================================================
 //  TESTE 3 - DETECCAO DE SINAL AC
 // ============================================================
-//  Pergunta: com sensor plugado, o circuito capta variacao?
-//  Como: mede min e max ao longo de 500 amostras rapidas
-//
-//  SEM corrente no fio: variacao pequena (so ruido)
-//  COM corrente no fio: variacao proporcional ao sinal AC
-//
-//  Este teste NAO julga se passou ou falhou - so mostra
-//  o comportamento e voce interpreta.
-// ============================================================
 void teste3_deteccaoSinal() {
-  Serial.println("--------------------------------------------------");
-  Serial.println(" TESTE 3: DETECCAO DE SINAL DO SENSOR");
-  Serial.println("--------------------------------------------------");
+  separador('-');
+  Serial.println(" TESTE 3: DETECCAO DE SINAL DO SENSOR (COM RMS)");
+  separador('-');
   Serial.println("Este teste mostra se o sensor esta captando algo.");
   Serial.println();
   Serial.println("VOCE VAI VER 10 MEDICOES:");
-  Serial.println("  - Sem carga no fio pinçado: variacao pequena");
-  Serial.println("  - Com carga: variacao aumenta proporcionalmente");
+  Serial.println("  - Sem carga no fio pinçado: valor RMS baixo");
+  Serial.println("  - Com carga: valor RMS aumenta proporcionalmente");
   Serial.println();
-  Serial.println("Medicao | Min  | Max  | Variacao | Amplitude");
-  Serial.println("--------+------+------+----------+----------");
+  Serial.println("Medicao | Variacao | Sinal AC (RMS)");
+  Serial.println("--------+----------+----------------");
 
   for (int m = 0; m < 10; m++) {
-    int minimo = 4095;
-    int maximo = 0;
+    AmostragemStats stats = amostrarADC(PINO_ADC, NUM_AMOSTRAS_TESTE);
+    float rmsMV = stats.rmsTensao * 1000; // Converte para mV para exibicao
 
-    // Amostra rapido pra capturar o sinal AC de 60Hz
-    for (int i = 0; i < NUM_AMOSTRAS_TESTE; i++) {
-      int leitura = analogRead(PINO_ADC);
-      if (leitura < minimo) minimo = leitura;
-      if (leitura > maximo) maximo = leitura;
-      delayMicroseconds(200);
-    }
-
-    int amplitude = maximo - minimo;
-    float amplitudeMV = (amplitude / (float)ADC_MAX) * VREF * 1000;
-
-    Serial.print("   ");
-    Serial.print(m + 1);
-    Serial.print("    | ");
-    Serial.print(minimo);
-    Serial.print(" | ");
-    Serial.print(maximo);
-    Serial.print(" |   ");
-    Serial.print(amplitude);
-    Serial.print("    | ");
-    Serial.print(amplitudeMV, 0);
-    Serial.println(" mV");
+    Serial.printf("   %d    |   %d    |   %.1f mV\n",
+                  m + 1, stats.variacao, rmsMV);
 
     delay(500);
   }
 
   Serial.println();
   Serial.println(">>> COMO INTERPRETAR:");
-  Serial.println("    - Amplitude < 100 mV: sem sinal significativo");
-  Serial.println("      (sensor sem corrente ou nada conectado)");
-  Serial.println("    - Amplitude 100-500 mV: corrente baixa");
-  Serial.println("    - Amplitude > 500 mV: corrente moderada/alta");
-  Serial.println();
-  Serial.println("    Se plugou o sensor e pincou um fio com corrente");
-  Serial.println("    mas amplitude continua baixa, o sensor pode nao");
-  Serial.println("    estar recebendo sinal (fio errado, mau contato).");
+  Serial.println("    - RMS < 30 mV: sem sinal significativo (ou sem corrente)");
+  Serial.println("    - RMS 30-150 mV: corrente baixa");
+  Serial.println("    - RMS > 150 mV: corrente moderada/alta");
   Serial.println();
   delay(1000);
-}
-
-// ============================================================
-//  FUNCOES AUXILIARES
-// ============================================================
-
-//  Le N amostras e retorna a media
-float lerADCMedia(int amostras) {
-  long soma = 0;
-  for (int i = 0; i < amostras; i++) {
-    soma += analogRead(PINO_ADC);
-    delayMicroseconds(200);
-  }
-  return (float)soma / amostras;
 }
