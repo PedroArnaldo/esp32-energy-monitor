@@ -1,5 +1,5 @@
 using System.Text.Json;
-using API.Models;
+using API.DTOs;
 using API.Services;
 
 namespace API.Endpoints;
@@ -27,9 +27,26 @@ public static class SensorEndpoints
         .Produces(StatusCodes.Status200OK)
         .Produces(StatusCodes.Status404NotFound);
 
-        group.MapPost("/save", async (Sensor sensor, ISensorServices sensorServices) =>
+        group.MapPost("/save", async (SensorDTORequests sensor, ISensorServices sensorServices) =>
         {
-           return await sensorServices.SaveSensorAsync(sensor);
+           try
+           {
+               var success = await sensorServices.SaveSensorAsync(sensor);
+               if (success)
+               {
+                   return Results.NoContent();
+               }
+               else
+               {
+                   return Results.NotFound();
+               }
+           }
+           catch (Exception ex)
+           {
+               // Log the exception (you can use a logging framework here)
+               Console.WriteLine($"An error occurred while saving the sensor: {ex.Message}");
+               return Results.Problem("An error occurred while saving the sensor.");
+           }
         })
         .WithName("SaveSensor")
         .Produces(StatusCodes.Status204NoContent)

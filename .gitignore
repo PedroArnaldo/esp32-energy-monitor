@@ -70,3 +70,4 @@ Testing/
 
 #db
 src/API/sensors.db
+src/esp32-energy-monitor/src/secrets.h

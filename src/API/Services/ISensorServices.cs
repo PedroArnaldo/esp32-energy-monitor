@@ -1,4 +1,4 @@
-using API.Models;
+using API.DTOs;
 
 namespace API.Services
 {
@@ -6,7 +6,7 @@ namespace API.Services
     {
         //Task<List<Sensor>> GetAllSensorsAsync();
        // Task<Sensor> GetSensorByIdAsync(int id);
-        Task<Sensor> SaveSensorAsync(Sensor sensor);
+        Task<bool> SaveSensorAsync(SensorDTORequests sensor);
         //Task<bool> UpdateSensorAsync(int id, Sensor sensor);
     }
 }

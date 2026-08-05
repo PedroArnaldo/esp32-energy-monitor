@@ -12,8 +12,39 @@
  *    2. Ruido (verifica estabilidade)
  *    3. Detecao de sinal (verifica se responde ao sensor com RMS)
  */
-
 #include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+#include "secrets.h"
+
+// ============================================================
+//  CONFIGURACAO DE REDE E API
+// ============================================================
+const char* WIFI_SSID_STR = WIFI_SSID;
+const char* WIFI_PASS_STR = WIFI_PASS;
+const char* API_URL       = "http://" API_HOST ":8080/api/sensors/save";
+
+// Identificacao desta unidade (vai pro banco)
+const char* EQUIPAMENTO = "Computador - 800w";
+const char* LOCALIZACAO = "Residencia - Sala";
+const char* UNIDADE     = "A";
+
+// ============================================================
+//  CALIBRACAO -- AJUSTE COM CARGA CONHECIDA NA BANCADA
+// ============================================================
+const float AMPS_POR_VOLT = 30.0;   // SCT-013-030: 1V = 30A
+const float TENSAO_REDE   = 127.0;  // 127 ou 220, conforme sua rede
+const float LIMIAR_RUIDO  = 0.030;  // abaixo de 30mV RMS = considera zero
+
+// ============================================================
+//  AGREGACAO -- amostra a cada 2s, envia a media a cada 30s
+// ============================================================
+const int AMOSTRAS_POR_ENVIO = 15;
+
+float somaCorrente = 0;
+int   contadorAmostras = 0;
 
 // ============================================================
 //  PARAMETROS
@@ -51,6 +82,11 @@ void teste3_deteccaoSinal();
 AmostragemStats amostrarADC(int pino, int numAmostras, int atrasoMicros = 200);
 float adcParaTensao(float valorADC);
 void  separador(char c);
+void conectarWiFi();
+void sincronizarRelogio();
+bool enviarLeitura(float correnteA, float potenciaVA);
+String timestampISO8601();
+void imprimirLeitura(float correnteA, float potenciaVA);
 
 // ============================================================
 //  SETUP
@@ -83,8 +119,11 @@ void setup() {
   separador('=');
   Serial.println("Se todos passaram: circuito OK, pode medir corrente.");
   Serial.println("Se algum falhou: veja a mensagem de diagnostico.");
-  Serial.println();
+  Serial.println(); 
   Serial.println("Reinicie o ESP32 para rodar os testes novamente.");
+
+  //conectarWiFi();
+  //sincronizarRelogio();
 }
 
 // ============================================================
@@ -94,9 +133,34 @@ void loop() {
   // Coleta um pacote de amostras e calcula o RMS para estabilizar a leitura ao vivo
   AmostragemStats monitor = amostrarADC(PINO_ADC, NUM_AMOSTRAS_TESTE);
 
-  Serial.printf("Monitor ao vivo RMS -> Offset DC: %.3fV | Sinal AC (RMS): %.4fV\n", 
-                adcParaTensao(monitor.media), 
-                monitor.rmsTensao);
+  // Converte RMS (Volts) para corrente (Amperes)
+  float corrente = monitor.rmsTensao * AMPS_POR_VOLT;
+  if (monitor.rmsTensao < LIMIAR_RUIDO) corrente = 0.0;  // descarta ruido de fundo
+
+  // Linha compacta a cada amostra, so pra acompanhar ao vivo
+  Serial.printf("Monitor RMS -> Offset: %.3fV | AC: %.4fV | Corrente: %.3fA\n",
+                adcParaTensao(monitor.media), monitor.rmsTensao, corrente);
+
+  somaCorrente += corrente;
+  contadorAmostras++;
+
+  // A cada AMOSTRAS_POR_ENVIO leituras, fecha a media e reporta
+  if (contadorAmostras >= AMOSTRAS_POR_ENVIO) {
+    float correnteMedia = somaCorrente / contadorAmostras;
+    float potencia      = correnteMedia * TENSAO_REDE;   // potencia aparente (VA)
+
+    // Mostra no Serial exatamente o que vai pro banco
+    imprimirLeitura(correnteMedia, potencia);
+
+    // if (enviarLeitura(correnteMedia, potencia)) {
+    //   Serial.println(">>> Gravado na API");
+    // } else {
+    //   Serial.println(">>> FALHA no envio (leitura perdida)");
+    // }
+
+    somaCorrente = 0;
+    contadorAmostras = 0;
+  }
 
   delay(2000);
 }
@@ -104,6 +168,26 @@ void loop() {
 // ============================================================
 //  FUNCOES AUXILIARES
 // ============================================================
+
+
+void imprimirLeitura(float correnteA, float potenciaVA) {
+  String ts = timestampISO8601();
+
+  // Sem NTP sincronizado, mostra tempo desde o boot como referencia
+  bool relogioOk = (ts.length() > 0);
+  if (!relogioOk) {
+    ts = "T+" + String(millis() / 1000) + "s (sem NTP)";
+  }
+  
+  Serial.println();
+  separador('-');
+  Serial.printf("Equipamento : %s\n",      EQUIPAMENTO);
+  Serial.printf("Timestamp   : %s\n",      ts.c_str());
+  Serial.printf("Corrente    : %.3f A\n",  correnteA);
+  Serial.printf("Potencia    : %.1f VA\n", potenciaVA);
+  separador('-');
+  Serial.println();
+}
 
 // Le N amostras do pino aplicando o calculo RMS para isolar o sinal AC
 AmostragemStats amostrarADC(int pino, int numAmostras, int atrasoMicros) {
@@ -276,4 +360,116 @@ void teste3_deteccaoSinal() {
   Serial.println("    - RMS > 150 mV: corrente moderada/alta");
   Serial.println();
   delay(1000);
+}
+
+// ------------------------------------------------------------
+//  WIFI
+// ------------------------------------------------------------
+void conectarWiFi() {
+  Serial.printf("Conectando em '%s'", WIFI_SSID_STR);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID_STR, WIFI_PASS_STR);
+
+  // Reconecta sozinho se cair -- essencial pra rodar dias seguidos
+  WiFi.setAutoReconnect(true);
+
+  unsigned long inicio = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - inicio < 20000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("Conectado! IP: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("FALHOU. Segue medindo offline, tenta de novo no envio.");
+  }
+}
+
+// ------------------------------------------------------------
+//  NTP -- o ESP32 nao tem RTC com bateria
+// ------------------------------------------------------------
+void sincronizarRelogio() {
+  // Grava sempre em UTC; a conversao pro fuso e' problema da API/dashboard
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+  Serial.print("Sincronizando relogio");
+  struct tm t;
+  unsigned long inicio = millis();
+  while (!getLocalTime(&t, 1000) && millis() - inicio < 15000) {
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (getLocalTime(&t)) {
+    Serial.printf("Relogio OK: %s", asctime(&t));
+  } else {
+    Serial.println("NTP falhou -- API vai usar o horario do servidor.");
+  }
+}
+
+// Retorna ISO 8601 em UTC, ou string vazia se o relogio nao sincronizou
+String timestampISO8601() {
+  struct tm t;
+  // timeout 0 = so consulta o relogio e retorna. Sem isso, o default de 5s
+  // travaria o loop a cada chamada enquanto o NTP nao estiver sincronizado.
+  if (!getLocalTime(&t, 0)) return "";
+
+  char buffer[32];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &t);
+  return String(buffer);
+}
+
+// ------------------------------------------------------------
+//  ENVIO HTTP
+// ------------------------------------------------------------
+bool enviarLeitura(float correnteA, float potenciaVA) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Sem WiFi -- tentando reconectar...");
+    WiFi.reconnect();
+    return false;
+  }
+
+  // ATENCAO: Current e Power sao string na API.
+  // Mandar numero puro no JSON resulta em 400 Bad Request.
+  char bufCorrente[16];
+  char bufPotencia[16];
+  dtostrf(correnteA,  0, 4, bufCorrente);
+  dtostrf(potenciaVA, 0, 2, bufPotencia);
+
+  JsonDocument doc;
+  doc["equipment"] = EQUIPAMENTO;
+  doc["current"]   = bufCorrente;
+  doc["power"]     = bufPotencia;
+  doc["location"]  = LOCALIZACAO;
+  doc["unit"]      = UNIDADE;
+
+  String ts = timestampISO8601();
+  if (ts.length() > 0) doc["timestamp"] = ts;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  WiFiClient client;
+  HTTPClient http;
+
+  if (!http.begin(client, API_URL)) {
+    Serial.println("http.begin() falhou -- confira a URL");
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(5000);          // nao trava o loop se a API estiver fora
+  http.setConnectTimeout(5000);
+
+  int codigo = http.POST(payload);
+  bool sucesso = (codigo >= 200 && codigo < 300);
+
+  if (!sucesso) {
+    Serial.printf("HTTP %d -- resposta: %s\n", codigo, http.getString().c_str());
+  }
+
+  http.end();
+  return sucesso;
 }
